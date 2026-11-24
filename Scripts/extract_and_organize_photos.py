@@ -1,237 +1,404 @@
 import csv
-from pathlib import Path
+import hashlib
+import json
+import os
 import re
 import shutil
-import geopandas as gpd
-import pandas as pd
+from pathlib import Path
+from typing import Any
+
 import pyogrio
 
-# --- PATH CONFIGURATION ---
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GDB_PATH = PROJECT_ROOT / "Data" / "data.gdb"
+DEFAULT_GDB = PROJECT_ROOT / "Data" / "data.gdb"
 PHOTOS_DIR = PROJECT_ROOT / "Photos"
-OUTPUT_DIR = PROJECT_ROOT / "Outputs"
-MANIFEST_CSV = OUTPUT_DIR / "organized_photos_manifest.csv"
+OUTPUTS_DIR = PROJECT_ROOT / "Outputs"
+MANIFEST_CSV = OUTPUTS_DIR / "organized_photos_manifest.csv"
+STATE_JSON = OUTPUTS_DIR / ".extraction_state.json"
 
-# Set to True to group photos into Entry_0001/ subfolders, or False to put all photos directly in Photos/
-GROUP_BY_SUBFOLDER = True
-
-# If True, clears existing Entry_* subfolders (or existing photos) before writing the new export
-CLEAN_BEFORE_OVERWRITE = True
-
-
-def sanitize_filename(name: str) -> str:
-  return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
-
-
-def find_layers(gdb_path: Path):
-  if not gdb_path.exists() or not gdb_path.is_dir():
-    raise FileNotFoundError(f"Geodatabase folder not found at: {gdb_path}")
-
-  layers = [name for name, _ in pyogrio.list_layers(str(gdb_path))]
-  attach_layers = [n for n in layers if n.endswith("__ATTACH")]
-  main_layers = [
-      n for n in layers if not n.endswith("__ATTACH") and not n.endswith("__REL")
-  ]
-  if not attach_layers or not main_layers:
-    raise RuntimeError(
-        f"Could not find main layer and __ATTACH table in {gdb_path}. Found:"
-        f" {layers}"
-    )
-  return main_layers[0], attach_layers[0]
+MANIFEST_COLUMNS = [
+    "entry_id",
+    "global_id",
+    "object_id",
+    "folder_name",
+    "photo_index",
+    "photo_filename",
+    "source_att_name",
+    "attachment_id",
+    "relative_path",
+    "sha256",
+    "size_bytes",
+]
 
 
-def get_col_ci(df: pd.DataFrame, *candidates: str) -> str | None:
-  """Case-insensitive column lookup."""
-  lower_map = {c.lower(): c for c in df.columns}
-  for cand in candidates:
-    if cand.lower() in lower_map:
-      return lower_map[cand.lower()]
-  return None
+def normalize_guid(value: Any) -> str:
+    """Normalize GlobalID/REL_GLOBALID strings without braces for stable keys."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = text.strip("{}").strip().upper()
+    return text
 
 
-def is_missing(val) -> bool:
-  return val is None or pd.isna(val) or str(val).strip() == ""
+def sanitize_filename(name: str, fallback: str = "photo.jpg") -> str:
+    """Sanitize attachment filenames while preserving extension if present."""
+    clean = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip())
+    clean = re.sub(r"\s+", "_", clean).strip("._")
+    if not clean:
+        return fallback
+    root, ext = os.path.splitext(clean)
+    if not ext:
+        return f"{root}.jpg"
+    return f"{root}{ext.lower()}"
 
 
-def prepare_output_targets(photos_dir: Path, manifest_csv: Path):
-  """Detects existing output folders/files and clears stale items for clean overwrite."""
-  photos_dir.mkdir(parents=True, exist_ok=True)
-  manifest_csv.parent.mkdir(parents=True, exist_ok=True)
-
-  existing_entry_dirs = [p for p in photos_dir.glob("Entry_*") if p.is_dir()]
-  existing_flat_files = [
-      p for p in photos_dir.iterdir() if p.is_file() and p.name != ".gitkeep"
-  ]
-  manifest_existed = manifest_csv.exists()
-
-  if existing_entry_dirs or existing_flat_files or manifest_existed:
-    print(
-        "Existing output detected: "
-        f"{len(existing_entry_dirs)} Entry_* folder(s), "
-        f"{len(existing_flat_files)} root file(s), "
-        f"manifest={'yes' if manifest_existed else 'no'}."
-    )
-
-  if CLEAN_BEFORE_OVERWRITE:
-    for entry_dir in existing_entry_dirs:
-      shutil.rmtree(entry_dir)
-    if not GROUP_BY_SUBFOLDER:
-      for flat_file in existing_flat_files:
-        flat_file.unlink()
-    if manifest_existed:
-      manifest_csv.unlink()
-    print("Cleared previous output folders/files for clean overwrite.")
+def find_col_ci(columns: list[str], candidates: list[str]) -> str | None:
+    """Find the first matching column name case-insensitively."""
+    lower_map = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    return None
 
 
-def main():
-  prepare_output_targets(PHOTOS_DIR, MANIFEST_CSV)
+def extract_blob_bytes(raw_blob: Any) -> bytes | None:
+    """Convert geodatabase attachment BLOB/bytes/memoryview/hex into bytes."""
+    if raw_blob is None:
+        return None
+    if isinstance(raw_blob, bytes):
+        return raw_blob if len(raw_blob) > 0 else None
+    if isinstance(raw_blob, bytearray):
+        return bytes(raw_blob) if len(raw_blob) > 0 else None
+    if isinstance(raw_blob, memoryview):
+        data = raw_blob.tobytes()
+        return data if len(data) > 0 else None
+    if isinstance(raw_blob, str):
+        stripped = raw_blob.strip()
+        if stripped.startswith("\\x") or stripped.startswith("0x"):
+            hex_str = stripped[2:]
+            try:
+                data = bytes.fromhex(hex_str)
+                return data if len(data) > 0 else None
+            except ValueError:
+                return None
+    return None
 
-  print(f"Using geodatabase: '{GDB_PATH}'")
-  main_layer_name, attach_layer_name = find_layers(GDB_PATH)
-  print(f"Main layer: '{main_layer_name}'")
-  print(f"Attachment table: '{attach_layer_name}'")
 
-  gdf = gpd.read_file(str(GDB_PATH), layer=main_layer_name)
-  attach_gdf = gpd.read_file(str(GDB_PATH), layer=attach_layer_name)
+def serialize_value(val: Any) -> Any:
+    """Make attribute or geometry values JSON/hash serializable."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        b = bytes(val)
+        return {"__bytes_len__": len(b), "__bytes_sha256__": hashlib.sha256(b).hexdigest()}
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    if hasattr(val, "__geo_interface__"):
+        return val.__geo_interface__
+    return str(val)
 
-  oid_col = get_col_ci(gdf, "OBJECTID", "oid", "fid")
-  gid_col = get_col_ci(gdf, "GlobalID", "GLOBALID")
-  rel_oid_col = get_col_ci(attach_gdf, "REL_OBJECTID", "REL_OID")
-  rel_gid_col = get_col_ci(attach_gdf, "REL_GLOBALID", "REL_GUID")
-  att_id_col = get_col_ci(attach_gdf, "ATTACHMENTID", "ATT_ID")
-  att_name_col = get_col_ci(attach_gdf, "ATT_NAME", "NAME", "FILENAME")
-  data_col = get_col_ci(attach_gdf, "DATA", "ATT_DATA")
 
-  if not data_col:
-    raise RuntimeError(
-        f"No binary attachment column found in {attach_layer_name}. Columns:"
-        f" {list(attach_gdf.columns)}"
-    )
+def discover_layers(gdb_path: Path) -> tuple[str, str | None]:
+    """Identify the main survey feature layer and optional attachment table in data.gdb."""
+    layers_df = pyogrio.list_layers(gdb_path)
+    layer_names = [row[0] for row in layers_df]
+    if not layer_names:
+        raise RuntimeError(f"No layers found inside {gdb_path}")
 
-  parent_by_oid = {}
-  parent_by_gid = {}
-  all_attr_columns = [c for c in gdf.columns if c != "geometry"]
+    att_layer = None
+    feature_layer = None
+    for name in layer_names:
+        lower = name.lower()
+        if ("attach" in lower or "__attach" in lower) and att_layer is None:
+            att_layer = name
+        elif feature_layer is None:
+            feature_layer = name
 
-  for idx, row in gdf.iterrows():
-    raw_oid = row.get(oid_col) if oid_col else None
-    entry_num = int(raw_oid) if not is_missing(raw_oid) else (idx + 1)
-    raw_gid = row.get(gid_col) if gid_col else None
-    norm_gid = "" if is_missing(raw_gid) else str(raw_gid).strip("{}").lower()
+    if feature_layer is None:
+        feature_layer = layer_names[0]
 
-    geom = row.geometry
-    lon = geom.x if (geom is not None and not geom.is_empty) else ""
-    lat = geom.y if (geom is not None and not geom.is_empty) else ""
+    return feature_layer, att_layer
 
-    record = {
-        "entry_number": entry_num,
-        "OBJECTID": "" if is_missing(raw_oid) else raw_oid,
-        "GlobalID": "" if is_missing(raw_gid) else str(raw_gid),
-        "lat": lat,
-        "lon": lon,
+
+def load_attachments_by_parent(gdb_path: Path, att_layer: str | None) -> dict[str, list[dict[str, Any]]]:
+    """Load attachments grouped by normalized parent GlobalID."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    if not att_layer:
+        return grouped
+
+    gdf_att = pyogrio.read_dataframe(gdb_path, layer=att_layer)
+    cols = list(gdf_att.columns)
+
+    rel_guid_col = find_col_ci(cols, ["REL_GLOBALID", "RELGLOBALID", "PARENTGLOBALID", "GLOBALID"])
+    att_id_col = find_col_ci(cols, ["ATTACHMENTID", "OBJECTID", "ID"])
+    att_name_col = find_col_ci(cols, ["ATT_NAME", "FILENAME", "NAME"])
+    data_col = find_col_ci(cols, ["DATA", "ATTACHMENT", "BLOB"])
+
+    if not rel_guid_col or not data_col:
+        return grouped
+
+    for idx, row in gdf_att.iterrows():
+        parent_guid = normalize_guid(row.get(rel_guid_col))
+        if not parent_guid:
+            continue
+
+        blob = extract_blob_bytes(row.get(data_col))
+        if not blob:
+            continue
+
+        att_id = row.get(att_id_col) if att_id_col else idx
+        att_name = str(row.get(att_name_col) or f"attachment_{att_id}.jpg")
+        blob_hash = hashlib.sha256(blob).hexdigest()
+
+        grouped.setdefault(parent_guid, []).append(
+            {
+                "attachment_id": serialize_value(att_id),
+                "att_name": att_name,
+                "size_bytes": len(blob),
+                "sha256": blob_hash,
+                "bytes": blob,
+            }
+        )
+
+    for parent_guid, items in grouped.items():
+        items.sort(key=lambda x: (str(x["attachment_id"]), x["att_name"], x["sha256"]))
+
+    return grouped
+
+
+def build_entry_snapshot(
+    gid: str,
+    oid: Any,
+    attr_dict: dict[str, Any],
+    attachments: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Compute a deterministic entry signature and metadata record."""
+    folder_name = f"Entry_{gid}"
+    att_meta = [
+        {
+            "attachment_id": a["attachment_id"],
+            "att_name": a["att_name"],
+            "size_bytes": a["size_bytes"],
+            "sha256": a["sha256"],
+        }
+        for a in attachments
+    ]
+
+    payload = {
+        "global_id": gid,
+        "object_id": serialize_value(oid),
+        "attributes": attr_dict,
+        "attachments": att_meta,
     }
-    for col in all_attr_columns:
-      if col not in record:
-        val = row.get(col)
-        record[col] = "" if is_missing(val) else str(val)
+    canonical_json = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    signature = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
-    if not is_missing(raw_oid):
-      parent_by_oid[int(raw_oid)] = record
-    if norm_gid:
-      parent_by_gid[norm_gid] = record
-
-  photo_counter_per_entry = {}
-  manifest_rows = []
-  unmatched_count = 0
-
-  for idx, att in attach_gdf.iterrows():
-    blob = att.get(data_col)
-    if blob is None or (isinstance(blob, float) and pd.isna(blob)):
-      continue
-
-    rel_oid_raw = att.get(rel_oid_col) if rel_oid_col else None
-    rel_gid_raw = att.get(rel_gid_col) if rel_gid_col else None
-    att_id = att.get(att_id_col) if att_id_col else (idx + 1)
-    raw_att_name = (
-        str(att.get(att_name_col))
-        if (att_name_col and not is_missing(att.get(att_name_col)))
-        else f"photo_{att_id}.jpg"
-    )
-    clean_att_name = sanitize_filename(Path(raw_att_name).name)
-
-    rel_oid_int = int(rel_oid_raw) if not is_missing(rel_oid_raw) else None
-    rel_gid_norm = (
-        "" if is_missing(rel_gid_raw) else str(rel_gid_raw).strip("{}").lower()
-    )
-
-    parent = None
-    if rel_oid_int is not None and rel_oid_int in parent_by_oid:
-      parent = parent_by_oid[rel_oid_int]
-    elif rel_gid_norm and rel_gid_norm in parent_by_gid:
-      parent = parent_by_gid[rel_gid_norm]
-
-    if parent:
-      entry_num = parent["entry_number"]
-    else:
-      unmatched_count += 1
-      entry_num = rel_oid_int if rel_oid_int is not None else 0
-
-    photo_counter_per_entry[entry_num] = (
-        photo_counter_per_entry.get(entry_num, 0) + 1
-    )
-    photo_seq = photo_counter_per_entry[entry_num]
-
-    entry_tag = f"Entry_{entry_num:04d}"
-    filename = f"{entry_tag}_Photo_{photo_seq:02d}_{clean_att_name}"
-
-    if GROUP_BY_SUBFOLDER:
-      target_dir = PHOTOS_DIR / entry_tag
-      target_dir.mkdir(parents=True, exist_ok=True)
-    else:
-      target_dir = PHOTOS_DIR
-
-    out_path = target_dir / filename
-    with open(out_path, "wb") as f:
-      f.write(bytes(blob))
-
-    manifest_row = {
-        "entry_number": entry_num,
-        "entry_tag": entry_tag,
-        "photo_seq": photo_seq,
-        "attachment_id": att_id,
-        "saved_relative_path": str(out_path.relative_to(PROJECT_ROOT)),
-        "original_att_name": raw_att_name,
-        "lat": parent["lat"] if parent else "",
-        "lon": parent["lon"] if parent else "",
-        "GlobalID": parent["GlobalID"] if parent else "",
+    state_entry = {
+        "signature": signature,
+        "folder_name": folder_name,
+        "object_id": serialize_value(oid),
+        "photo_count": len(attachments),
+        "attachment_hashes": [a["sha256"] for a in attachments],
     }
-    if parent:
-      for col in all_attr_columns:
-        if col not in manifest_row:
-          manifest_row[col] = parent[col]
+    return signature, state_entry
 
-    manifest_rows.append(manifest_row)
 
-  manifest_rows.sort(key=lambda r: (r["entry_number"], r["photo_seq"]))
+def write_entry_photos(gid: str, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rebuild Photos/Entry_<GlobalID> cleanly and return manifest rows for this entry."""
+    folder_name = f"Entry_{gid}"
+    entry_dir = PHOTOS_DIR / folder_name
 
-  if manifest_rows:
-    fieldnames = list(manifest_rows[0].keys())
-    with open(MANIFEST_CSV, "w", encoding="utf-8", newline="") as f:
-      writer = csv.DictWriter(f, fieldnames=fieldnames)
-      writer.writeheader()
-      writer.writerows(manifest_rows)
+    if entry_dir.exists():
+        shutil.rmtree(entry_dir)
+    entry_dir.mkdir(parents=True, exist_ok=True)
 
-  print(
-      f"Done! Extracted {len(manifest_rows)} photos across"
-      f" {len(photo_counter_per_entry)} entries into {PHOTOS_DIR}"
-  )
-  if unmatched_count:
-    print(
-        f"Warning: {unmatched_count} photos could not be matched to a parent"
-        " survey row."
+    rows: list[dict[str, Any]] = []
+    for idx, att in enumerate(attachments, start=1):
+        safe_name = sanitize_filename(att["att_name"], fallback=f"photo_{idx:02d}.jpg")
+        out_name = f"{gid}_{idx:02d}_{safe_name}"
+        out_path = entry_dir / out_name
+        out_path.write_bytes(att["bytes"])
+
+        rel_path = out_path.relative_to(PROJECT_ROOT).as_posix()
+        rows.append(
+            {
+                "entry_id": gid,
+                "global_id": gid,
+                "object_id": "",
+                "folder_name": folder_name,
+                "photo_index": idx,
+                "photo_filename": out_name,
+                "source_att_name": att["att_name"],
+                "attachment_id": att["attachment_id"],
+                "relative_path": rel_path,
+                "sha256": att["sha256"],
+                "size_bytes": att["size_bytes"],
+            }
+        )
+
+    return rows
+
+
+def load_previous_state() -> dict[str, dict[str, Any]]:
+    """Load previous entry state map from Outputs/.extraction_state.json."""
+    if not STATE_JSON.exists():
+        return {}
+    try:
+        data = json.loads(STATE_JSON.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+            return data["entries"]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def load_existing_manifest() -> list[dict[str, str]]:
+    """Load existing rows from Outputs/organized_photos_manifest.csv if present."""
+    if not MANIFEST_CSV.exists():
+        return []
+    with MANIFEST_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [dict(r) for r in reader]
+
+
+def write_manifest(rows: list[dict[str, Any]]) -> None:
+    """Write normalized manifest rows to Outputs/organized_photos_manifest.csv."""
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    with MANIFEST_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({col: r.get(col, "") for col in MANIFEST_COLUMNS})
+
+
+def entry_folder_intact(gid: str, expected_hashes: list[str]) -> bool:
+    """Verify that Entry_<GlobalID> and its files exist and match expected SHA-256 hashes."""
+    entry_dir = PHOTOS_DIR / f"Entry_{gid}"
+    if not entry_dir.is_dir():
+        return False
+    existing_files = [p for p in entry_dir.iterdir() if p.is_file()]
+    if len(existing_files) != len(expected_hashes):
+        return False
+    actual_hashes = sorted(
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in existing_files
     )
-  print(f"Full index saved to: {MANIFEST_CSV}")
+    return actual_hashes == sorted(expected_hashes)
+
+
+def run_incremental_extraction(gdb_path: Path = DEFAULT_GDB) -> None:
+    if not gdb_path.exists():
+        raise FileNotFoundError(f"Geodatabase not found at: {gdb_path}")
+
+    PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    feature_layer, att_layer = discover_layers(gdb_path)
+    gdf = pyogrio.read_dataframe(gdb_path, layer=feature_layer)
+    cols = list(gdf.columns)
+
+    gid_col = find_col_ci(cols, ["GLOBALID", "GLOBAL_ID", "GUID"])
+    if not gid_col:
+        raise KeyError(f"Could not find a GlobalID column in layer '{feature_layer}'. Columns: {cols}")
+
+    oid_col = find_col_ci(cols, ["OBJECTID", "OID", "FID"])
+    attachments_by_gid = load_attachments_by_parent(gdb_path, att_layer)
+
+    current_entries: dict[str, dict[str, Any]] = {}
+    current_signatures: dict[str, str] = {}
+    current_attachments: dict[str, list[dict[str, Any]]] = {}
+    current_oids: dict[str, Any] = {}
+
+    for _, row in gdf.iterrows():
+        gid = normalize_guid(row.get(gid_col))
+        if not gid:
+            continue
+
+        oid = row.get(oid_col) if oid_col else ""
+        attr_dict: dict[str, Any] = {}
+        for c in cols:
+            if c == "geometry":
+                attr_dict["geometry"] = serialize_value(row.get(c))
+            else:
+                attr_dict[c] = serialize_value(row.get(c))
+
+        atts = attachments_by_gid.get(gid, [])
+        sig, state_meta = build_entry_snapshot(gid, oid, attr_dict, atts)
+
+        current_entries[gid] = state_meta
+        current_signatures[gid] = sig
+        current_attachments[gid] = atts
+        current_oids[gid] = serialize_value(oid)
+
+    prev_entries = load_previous_state()
+    existing_manifest = load_existing_manifest()
+
+    prev_gids = set(prev_entries.keys())
+    curr_gids = set(current_entries.keys())
+
+    deleted_gids = sorted(prev_gids - curr_gids)
+    added_gids = sorted(curr_gids - prev_gids)
+    common_gids = sorted(curr_gids & prev_gids)
+
+    modified_gids: list[str] = []
+    unchanged_gids: list[str] = []
+
+    for gid in common_gids:
+        prev_sig = prev_entries[gid].get("signature")
+        expected_hashes = prev_entries[gid].get("attachment_hashes", [])
+        if prev_sig != current_signatures[gid] or not entry_folder_intact(gid, expected_hashes):
+            modified_gids.append(gid)
+        else:
+            unchanged_gids.append(gid)
+
+    # 1. Remove deleted entry folders
+    for gid in deleted_gids:
+        folder = PHOTOS_DIR / f"Entry_{gid}"
+        if folder.exists():
+            shutil.rmtree(folder)
+
+    # 2. Keep manifest rows for unchanged entries only
+    changed_or_removed_gids = set(deleted_gids) | set(added_gids) | set(modified_gids)
+    kept_rows: list[dict[str, Any]] = []
+    for row in existing_manifest:
+        row_gid = normalize_guid(row.get("global_id") or row.get("entry_id"))
+        if row_gid and row_gid not in changed_or_removed_gids:
+            kept_rows.append(row)
+
+    # 3. Extract photos and build manifest rows for added and modified entries
+    new_or_updated_rows: list[dict[str, Any]] = []
+    for gid in sorted(set(added_gids) | set(modified_gids)):
+        entry_rows = write_entry_photos(gid, current_attachments[gid])
+        for r in entry_rows:
+            r["object_id"] = current_oids[gid]
+        new_or_updated_rows.extend(entry_rows)
+
+    all_rows = kept_rows + new_or_updated_rows
+    all_rows.sort(
+        key=lambda r: (
+            str(r.get("global_id", "")),
+            int(r.get("photo_index") or 0),
+        )
+    )
+    write_manifest(all_rows)
+
+    # 4. Save updated state after files and CSV are written
+    state_payload = {
+        "source_gdb": str(gdb_path),
+        "feature_layer": feature_layer,
+        "attachment_layer": att_layer,
+        "entries": current_entries,
+    }
+    STATE_JSON.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+
+    print(
+        f"Incremental extraction complete | "
+        f"Added: {len(added_gids)}, Modified: {len(modified_gids)}, "
+        f"Deleted: {len(deleted_gids)}, Unchanged (skipped): {len(unchanged_gids)}"
+    )
 
 
 if __name__ == "__main__":
-  main()
+    run_incremental_extraction()
