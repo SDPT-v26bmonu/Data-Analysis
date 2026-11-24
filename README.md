@@ -1,6 +1,6 @@
 Make sure ArcGIS data is from this link 
 https://serendpt.maps.arcgis.com/home/item.html?id=6141d2ed34c049ebb7125bc0614884c2#overview
-Export the data
+Export the data as a "geodatabase" file
 The File System should look as follows
 Need to add /Data yourself
 /Outputs and /Photos should be created and populated when running the "extract_and_organize_photos.py"
