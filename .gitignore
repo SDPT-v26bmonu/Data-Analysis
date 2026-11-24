@@ -1,0 +1,29 @@
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets & local config
+.env
+.env.*
+
+# Large spatial datasets, extracted photos, and generated outputs
+Data/
+Photos/
+Outputs/
+*.gdb/
+*.gdb.zip
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
